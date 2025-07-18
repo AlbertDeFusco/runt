@@ -422,6 +422,51 @@ export async function handleToolCallWithResult(
     }
 
     default:
+      // Handle MCP tools (tools with "mcp_" prefix)
+      if (name.startsWith("mcp_")) {
+        const toolName = name.substring(4); // Remove "mcp_" prefix
+        
+        logger.info("Calling MCP tool via HTTP", {
+          originalName: name,
+          toolName,
+          argsKeys: Object.keys(args),
+        });
+
+        try {
+          const mcpEndpoint = (globalThis as any).Deno.env.get("MCP_TOOL_CALL_ENDPOINT");
+          
+          const response = await fetch(mcpEndpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              name: toolName,
+              arguments: args,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          const result = await response.text();
+
+          logger.info("MCP tool executed successfully", {
+            toolName,
+            result,
+          });
+
+          return `Tool ${name} executed successfully: ${result}`;
+        } catch (error) {
+          logger.error("MCP tool execution failed", {
+            toolName: name,
+            error: String(error),
+          });
+          throw new Error(`Failed to execute MCP tool ${name}: ${String(error)}`);
+        }
+      }
+
       // Handle unknown tools via Python worker if available
       if (sendWorkerMessage) {
         logger.info("Calling registered Python tool via worker", {

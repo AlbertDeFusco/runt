@@ -10,6 +10,69 @@ import { AI_TOOL_CALL_MIME_TYPE, AI_TOOL_RESULT_MIME_TYPE } from "@runt/schema";
 import { NOTEBOOK_TOOLS } from "./tool-registry.ts";
 import type { NotebookTool } from "./tool-registry.ts";
 
+// MCP Tools interface for the API response
+interface MCPTool {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: string;
+    properties: Record<string, unknown>;
+    required?: string[];
+  };
+}
+
+// Cache for MCP tools to avoid repeated requests
+let mcpToolsCache: NotebookTool[] | null = null;
+let mcpToolsCacheTime = 0;
+const MCP_TOOLS_CACHE_TTL = 30000; // 30 seconds cache
+
+/**
+ * Fetch MCP tools from the API endpoint
+ */
+async function fetchMCPTools(mcpEndpoint: string): Promise<NotebookTool[]> {
+  // Check cache first
+  const now = Date.now();
+  if (mcpToolsCache && (now - mcpToolsCacheTime) < MCP_TOOLS_CACHE_TTL) {
+    return mcpToolsCache;
+  }
+
+  try {
+    const response = await fetch(mcpEndpoint);
+    if (!response.ok) {
+      throw new Error(`MCP API responded with status: ${response.status}`);
+    }
+
+    const data: MCPTool[] = await response.json();
+    
+    // Convert MCP tools to NotebookTool format
+    const convertedTools: NotebookTool[] = data.map((mcpTool: MCPTool) => ({
+      name: `mcp_${mcpTool.name}`,
+      description: mcpTool.description,
+      parameters: {
+        type: mcpTool.inputSchema.type,
+        properties: mcpTool.inputSchema.properties as Record<string, ToolParameter>,
+        required: mcpTool.inputSchema.required || [],
+      },
+    }));
+
+    // Update cache
+    mcpToolsCache = convertedTools;
+    mcpToolsCacheTime = now;
+
+    return convertedTools;
+  } catch (error) {
+    console.warn(`Failed to fetch MCP tools from ${mcpEndpoint}:`, error);
+    return []; // Return empty array on failure
+  }
+}
+
+interface ToolParameter {
+  type: string;
+  enum?: string[];
+  description?: string;
+  default?: string;
+}
+
 // Define message types inline to avoid import issues
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -17,6 +80,7 @@ interface OpenAIConfig {
   apiKey?: string;
   baseURL?: string;
   organization?: string;
+  mcpEndpoint?: string;
 }
 
 interface ToolCall {
@@ -66,6 +130,7 @@ export class RuntOpenAIClient {
   private isConfigured = false;
   private logger = createLogger("openai-client");
   private notebookTools: NotebookTool[];
+  private mcpEndpoint: string;
 
   constructor(config?: OpenAIConfig, notebookTools: NotebookTool[] = []) {
     // Don't configure immediately to avoid early initialization logs
@@ -73,11 +138,22 @@ export class RuntOpenAIClient {
       this.configure(config);
     }
     this.notebookTools = [...notebookTools];
+    this.mcpEndpoint = config?.mcpEndpoint || Deno.env.get("MCP_CLIENT_ENDPOINT");
   }
 
   configure(config?: OpenAIConfig) {
     const apiKey = config?.apiKey || Deno.env.get("OPENAI_API_KEY");
     const baseURL = config?.baseURL || Deno.env.get("OPENAI_BASE_URL");
+
+    // Update MCP endpoint if provided, otherwise check environment variable
+    if (config?.mcpEndpoint) {
+      this.mcpEndpoint = config.mcpEndpoint;
+    } else {
+      const envMcpEndpoint = Deno.env.get("MCP_ENDPOINT");
+      if (envMcpEndpoint) {
+        this.mcpEndpoint = envMcpEndpoint;
+      }
+    }
 
     if (!apiKey) {
       // Don't log warning at startup - only when actually trying to use OpenAI
@@ -92,7 +168,9 @@ export class RuntOpenAIClient {
         organization: config?.organization,
       });
       this.isConfigured = true;
-      this.logger.info("OpenAI client configured successfully");
+      this.logger.info("OpenAI client configured successfully", {
+        mcpEndpoint: this.mcpEndpoint,
+      });
     } catch (error) {
       this.logger.error("Failed to configure OpenAI client", error);
       this.isConfigured = false;
@@ -105,6 +183,31 @@ export class RuntOpenAIClient {
       this.configure();
     }
     return this.isConfigured && this.client !== null;
+  }
+
+  /**
+   * Get the current MCP endpoint URL
+   */
+  getMCPEndpoint(): string {
+    return this.mcpEndpoint;
+  }
+
+  /**
+   * Set a new MCP endpoint URL and clear the cache
+   */
+  setMCPEndpoint(endpoint: string): void {
+    this.mcpEndpoint = endpoint;
+    mcpToolsCache = null; // Clear cache when endpoint changes
+    mcpToolsCacheTime = 0;
+  }
+
+  /**
+   * Manually refresh the MCP tools cache
+   */
+  async refreshMCPTools(): Promise<NotebookTool[]> {
+    mcpToolsCache = null; // Clear cache
+    mcpToolsCacheTime = 0;
+    return await fetchMCPTools(this.mcpEndpoint);
   }
 
   /**
@@ -361,10 +464,14 @@ export class RuntOpenAIClient {
 
         // Prepare tools if enabled
         let all_tools: NotebookTool[];
+
+        // Fetch MCP tools and combine with existing tools
+        const mcpTools = await fetchMCPTools(this.mcpEndpoint);
+        
         if (this.notebookTools.length > 0) {
-          all_tools = [...this.notebookTools, ...NOTEBOOK_TOOLS];
+          all_tools = [...this.notebookTools, ...NOTEBOOK_TOOLS, ...mcpTools];
         } else {
-          all_tools = [...NOTEBOOK_TOOLS];
+          all_tools = [...NOTEBOOK_TOOLS, ...mcpTools];
         }
         const tools = enableTools
           ? all_tools.map((tool) => ({
